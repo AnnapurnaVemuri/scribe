@@ -290,6 +290,11 @@ bool scribeHandler::createCategoryFromModel(
   }
   pstores->push_back(pstore);
 
+  if (auditMgr != NULL && auditMgr.get() != NULL) {
+    pstore->setAuditManager(auditMgr);
+    LOG_OPER("[%s] configured audit manager in store", category.c_str());
+  }
+
   return true;
 }
 
@@ -414,6 +419,22 @@ void scribeHandler::addMessage(
   }
 }
 
+void scribeHandler::auditMessageReceived(const LogEntry& entry) {
+  // if audit manager is configured and message category itself is not audit,
+  // then audit this message as received
+  try {
+    if (auditMgr != NULL  && auditMgr.get() != NULL &&
+       (entry.category.compare(auditTopic) != 0)) {
+      auditMgr->auditMessage(entry, true);
+    }
+  } catch (const std::exception& e) {
+    LOG_OPER("[%s] Failed to audit received message. Error <%s>", 
+      entry.category.c_str(), e.what());
+  } catch (...) {
+    LOG_OPER("[%s] Failed to audit received message. Unexpected error.",
+      entry.category.c_str());
+  }
+}
 
 ResultCode scribeHandler::Log(const vector<LogEntry>&  messages) {
   ResultCode result = TRY_LATER;
@@ -476,6 +497,9 @@ ResultCode scribeHandler::Log(const vector<LogEntry>&  messages) {
       continue;
     }
 
+    // audit this message as received
+    auditMessageReceived(*msg_iter);
+    
     // Log this message
     addMessage(*msg_iter, store_list);
   }
@@ -651,6 +675,12 @@ void scribeHandler::initialize() {
 
   if (numstores) {
     LOG_OPER("configured <%d> stores", numstores);
+
+    // if audit manager is initialized, pass it to all stores
+    if (auditMgr != NULL && auditMgr.get() != NULL) {
+      LOG_OPER("configuring audit manager in all stores");
+      configureAuditManagerInAllStores(); 
+   }
   } else {
     setStatusDetails("No stores configured successfully");
     perfect_config = false;
@@ -674,6 +704,40 @@ void scribeHandler::initialize() {
   }
 }
 
+void scribeHandler::configureAuditManagerInAllStores() {
+  int storeCount = 0;
+  
+  // set audit manager to stores within categories map.
+  for (category_map_t::iterator cat_iter = categories.begin();
+       cat_iter != categories.end(); cat_iter++) { 
+    boost::shared_ptr<store_list_t> pstores = cat_iter->second;
+    for (store_list_t::iterator store_iter = pstores->begin();
+         store_iter != pstores->end(); store_iter++) { 
+      (*store_iter)->setAuditManager(auditMgr);
+      storeCount++;
+    }
+  }
+
+  // set audit manager to stores within category_prefixes map
+  for (category_map_t::iterator cat_prefix_iter = category_prefixes.begin(); 
+       cat_prefix_iter != category_prefixes.end(); cat_prefix_iter++) {
+    boost::shared_ptr<store_list_t> pstores = cat_prefix_iter->second;
+    for (store_list_t::iterator store_iter = pstores->begin();
+         store_iter != pstores->end(); store_iter++) {
+      (*store_iter)->setAuditManager(auditMgr);
+      storeCount++;
+    }
+  }
+
+  // set audit manager to default stores
+  for (store_list_t::iterator store_iter = defaultStores.begin(); 
+         store_iter != defaultStores.end(); store_iter++) {
+      (*store_iter)->setAuditManager(auditMgr);
+      storeCount++;
+    }
+
+  LOG_OPER("configured audit manager in <%d> stores", storeCount);
+}
 
 // Configures the store specified by the store configuration. Returns false if failed.
 bool scribeHandler::configureStore(pStoreConf store_conf, int *numstores) {
@@ -872,6 +936,13 @@ shared_ptr<StoreQueue> scribeHandler::configureStoreCategory(
       categories[category] = pstores;
     }
     pstores->push_back(pstore);
+  }
+
+  // check if the category is '_audit'
+  if (category.compare(auditTopic) == 0) {
+    auditMgr = shared_ptr<AuditManager>(new AuditManager(pstore));
+    pstore->setAuditStore(true);
+    LOG_OPER("[%s] Initialized audit manager", category.c_str()); 
   }
 
   return pstore;

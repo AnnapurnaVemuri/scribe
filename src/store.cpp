@@ -122,6 +122,7 @@ Store::Store(StoreQueue* storeq,
   : categoryHandled(category),
     multiCategory(multi_category),
     storeType(type),
+    isPrimary(false),
     storeQueue(storeq) {
   pthread_mutex_init(&statusMutex, NULL);
 }
@@ -175,6 +176,26 @@ bool Store::empty(struct tm* now) {
 
 const std::string& Store::getType() {
   return storeType;
+}
+
+void Store::auditMessagesSent(boost::shared_ptr<logentry_vector_t>& messages,
+                         unsigned long offset, unsigned long count) {
+  // audit these messages as sent ONLY if it is a primary store AND
+  // message category is not audit AND audit store is configured in scribe
+  try {
+    boost::shared_ptr<AuditManager> auditMgr = storeQueue->getAuditManager();
+    if (isPrimary && (categoryHandled.compare(auditTopic) != 0) &&
+        auditMgr != NULL && auditMgr.get() != NULL) {
+      auditMgr->auditMessages(messages, categoryHandled,
+      offset, count, false);
+    }
+  } catch (const std::exception& e) {
+    LOG_OPER("[%s] Failed to audit sent messages. Error <%s>",
+      categoryHandled.c_str(), e.what());
+  } catch (...) {
+    LOG_OPER("[%s] Failed to audit sent messages. Unexpected error.",
+      categoryHandled.c_str());
+  }
 }
 
 FileStoreBase::FileStoreBase(StoreQueue* storeq,
@@ -904,7 +925,11 @@ bool FileStore::writeMessages(boost::shared_ptr<logentry_vector_t> messages,
       // Write buffer if processing last message or if larger than allowed
       if ((current_size_buffered > max_write_size && maxSize != 0) ||
           messages->end() == iter + 1 ) {
-        if (!write_file->write(write_buffer)) {
+        bool status = write_file->write(write_buffer);
+        if (status) {
+          // if write succeeded, audit these messages as sent 
+          auditMessagesSent(messages, num_written, num_buffered);
+        } else {
           LOG_OPER("[%s] File store failed to write (%lu) messages to file",
                    categoryHandled.c_str(), messages->size());
           setStatus("File write error");
@@ -1424,6 +1449,11 @@ void BufferStore::configure(pStoreConf configuration, pStoreConf parent) {
       primaryStore = createStore(storeQueue, type, categoryHandled, false,
                                   multiCategory);
       primaryStore->configure(primary_store_conf, storeConf);
+      // set the primary flag for this store to true. This will be used later
+      // to decide whether to audit the sent messages. 
+      primaryStore->setStorePrimary(true);
+      LOG_OPER("[%s] Store of type [%s] set to primary", categoryHandled.c_str(),
+               type.c_str());
     }
   }
 
@@ -1500,6 +1530,8 @@ shared_ptr<Store> BufferStore::copy(const std::string &category) {
   store->adaptiveBackoff = adaptiveBackoff;
 
   store->primaryStore = primaryStore->copy(category);
+  // copy the primary status
+  store->primaryStore->setStorePrimary(primaryStore->isStorePrimary());
   store->secondaryStore = secondaryStore->copy(category);
   return copied;
 }
@@ -2051,7 +2083,13 @@ NetworkStore::handleMessages(boost::shared_ptr<logentry_vector_t> messages) {
         g_Handler->incCounter(categoryHandled, "eofs");
     close();
   }
-  return (ret == CONN_OK);
+  bool status = (ret == CONN_OK);
+  // if write succeeded, audit these messages as sent
+  if (status) {
+    auditMessagesSent(messages, 0, messages->size());
+  }
+
+  return status;
 }
 
 void NetworkStore::flush() {
